@@ -7,8 +7,17 @@ import System.Console.Haskeline.Prefs(Prefs)
 import System.Console.Haskeline.Completion(Completion)
 
 import Control.Concurrent
+import Control.Concurrent.STM
+import Control.Exception (Exception, SomeException(..))
+import Control.Monad.Catch
+    ( MonadMask
+    , bracket
+    , handle
+    , throwM
+    , finally
+    )
 import Data.Word
-import Control.Exception (fromException, AsyncException(..),bracket_)
+import Control.Exception (fromException, AsyncException(..))
 import Data.Typeable
 import System.IO
 import Control.Monad(liftM,when,guard)
@@ -16,7 +25,7 @@ import System.IO.Error (isEOFError)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 
-class (MonadReader Layout m, MonadException m) => Term m where
+class (MonadReader Layout m, MonadIO m, MonadMask m) => Term m where
     reposition :: Layout -> LineChars -> m ()
     moveToNextLine :: LineChars -> m ()
     printLines :: [String] -> m ()
@@ -33,7 +42,7 @@ data RunTerm = RunTerm {
             -- | Write unicode characters to stdout.
             putStrOut :: String -> IO (),
             termOps :: Either TermOps FileOps,
-            wrapInterrupt :: forall a . IO a -> IO a,
+            wrapInterrupt :: forall a m . (MonadIO m, MonadMask m) => m a -> m a,
             closeTerm :: IO ()
     }
 
@@ -50,12 +59,12 @@ data TermOps = TermOps
 -- Without it, if you are using another thread to process the logging
 -- and write on screen via exposed externalPrint, latest writes from
 -- this thread are not able to cross the thread boundary in time.
-flushEventQueue :: (String -> IO ()) -> Chan Event -> IO ()
+flushEventQueue :: (String -> IO ()) -> TChan Event -> IO ()
 flushEventQueue print' eventChan = yield >> loopUntilFlushed
     where loopUntilFlushed = do
-              flushed <- isEmptyChan eventChan
+              flushed <- atomically $ isEmptyTChan eventChan
               if flushed then return () else do
-                  event <- readChan eventChan
+                  event <- atomically $ readTChan eventChan
                   case event of
                       ExternalPrint str -> do
                           print' (str ++ "\n") >> loopUntilFlushed
@@ -67,7 +76,7 @@ flushEventQueue print' eventChan = yield >> loopUntilFlushed
 -- Backends can assume that getLocaleLine, getLocaleChar and maybeReadNewline
 -- are "wrapped" by wrapFileInput.
 data FileOps = FileOps {
-            withoutInputEcho :: forall m a . MonadException m => m a -> m a,
+            withoutInputEcho :: forall m a . (MonadIO m, MonadMask m) => m a -> m a,
             -- ^ Perform an action without echoing input.
             wrapFileInput :: forall a . IO a -> IO a,
             getLocaleLine :: MaybeT IO String,
@@ -99,12 +108,12 @@ instance Exception Interrupt where
 
 
 
-class (MonadReader Prefs m , MonadReader Layout m, MonadException m)
+class (MonadReader Prefs m , MonadReader Layout m, MonadIO m, MonadMask m)
         => CommandMonad m where
     runCompletion :: (String,String) -> m (String,[Completion])
 
-instance (MonadTrans t, CommandMonad m, MonadReader Prefs (t m),
-        MonadException (t m),
+instance {-# OVERLAPPABLE #-} (MonadTrans t, CommandMonad m, MonadReader Prefs (t m),
+        MonadIO (t m), MonadMask (t m),
         MonadReader Layout (t m))
             => CommandMonad (t m) where
     runCompletion = lift . runCompletion
@@ -121,36 +130,29 @@ data Event
   | ExternalPrint String
   deriving Show
 
-keyEventLoop :: IO [Event] -> Chan Event -> IO Event
+keyEventLoop :: IO [Event] -> TChan Event -> IO Event
 keyEventLoop readEvents eventChan = do
     -- first, see if any events are already queued up (from a key/ctrl-c
     -- event or from a previous call to getEvent where we read in multiple
     -- keys)
-    isEmpty <- isEmptyChan eventChan
+    isEmpty <- atomically $ isEmptyTChan eventChan
     if not isEmpty
-        then readChan eventChan
+        then atomically $ readTChan eventChan
         else do
-            lock <- newEmptyMVar
-            tid <- forkIO $ handleErrorEvent (readerLoop lock)
-            readChan eventChan `finally` do
-                            putMVar lock ()
-                            killThread tid
+            tid <- forkIO $ handleErrorEvent readerLoop
+            atomically (readTChan eventChan) `finally` killThread tid
   where
-    readerLoop lock = do
+    readerLoop = do
         es <- readEvents
         if null es
-            then readerLoop lock
-            else -- Use the lock to work around the fact that writeList2Chan
-                 -- isn't atomic.  Otherwise, some events could be ignored if
-                 -- the subthread is killed before it saves them in the chan.
-                 bracket_ (putMVar lock ()) (takeMVar lock) $
-                    writeList2Chan eventChan es
+            then readerLoop
+            else atomically $ mapM_ (writeTChan eventChan) es
     handleErrorEvent = handle $ \e -> case fromException e of
                                 Just ThreadKilled -> return ()
-                                _ -> writeChan eventChan (ErrorEvent e)
+                                _ -> atomically $ writeTChan eventChan (ErrorEvent e)
 
-saveKeys :: Chan Event -> [Key] -> IO ()
-saveKeys ch = writeChan ch . KeyInput
+saveKeys :: TChan Event -> [Key] -> IO ()
+saveKeys ch = atomically . writeTChan ch . KeyInput
 
 data Layout = Layout {width, height :: Int}
                     deriving (Show,Eq)
@@ -159,14 +161,14 @@ data Layout = Layout {width, height :: Int}
 -- Utility functions for the various backends.
 
 -- | Utility function since we're not using the new IO library yet.
-hWithBinaryMode :: MonadException m => Handle -> m a -> m a
+hWithBinaryMode :: (MonadIO m, MonadMask m) => Handle -> m a -> m a
 hWithBinaryMode h = bracket (liftIO $ hGetEncoding h)
                         (maybe (return ()) (liftIO . hSetEncoding h))
                         . const . (liftIO (hSetBinaryMode h True) >>)
 
 -- | Utility function for changing a property of a terminal for the duration of
 -- a computation.
-bracketSet :: (Eq a, MonadException m) => IO a -> (a -> IO ()) -> a -> m b -> m b
+bracketSet :: (MonadMask m, MonadIO m) => IO a -> (a -> IO ()) -> a -> m b -> m b
 bracketSet getState set newState f = bracket (liftIO getState)
                             (liftIO . set)
                             (\_ -> liftIO (set newState) >> f)
@@ -199,10 +201,10 @@ hMaybeReadNewline h = returnOnEOF () $ do
         c <- hLookAhead h
         when (c == '\n') $ getChar >> return ()
 
-returnOnEOF :: MonadException m => a -> m a -> m a
+returnOnEOF :: MonadMask m => a -> m a -> m a
 returnOnEOF x = handle $ \e -> if isEOFError e
                                 then return x
-                                else throwIO e
+                                else throwM e
 
 -- | Utility function to correctly get a line of input as an undecoded ByteString.
 hGetLocaleLine :: Handle -> MaybeT IO ByteString

@@ -11,14 +11,22 @@ import Foreign.C
 import System.Win32 hiding (multiByteToWideChar)
 import Graphics.Win32.Misc(getStdHandle, sTD_OUTPUT_HANDLE)
 import Data.List(intercalate)
+import Control.Concurrent.STM
 import Control.Concurrent hiding (throwTo)
 import Data.Char(isPrint)
 import Data.Maybe(mapMaybe)
-import Control.Applicative
+import Control.Exception (IOException, throwTo)
 import Control.Monad
+import Control.Monad.Catch
+    ( MonadThrow
+    , MonadCatch
+    , MonadMask
+    , bracket
+    , handle
+    )
 
 import System.Console.Haskeline.Key
-import System.Console.Haskeline.Monads hiding (Handler)
+import System.Console.Haskeline.Monads
 import System.Console.Haskeline.LineState
 import System.Console.Haskeline.Term
 import System.Console.Haskeline.Backend.WCWidth
@@ -45,7 +53,7 @@ getNumberOfEvents h = alloca $ \numEventsPtr -> do
         $ c_GetNumberOfConsoleInputEvents h numEventsPtr
     fmap fromEnum $ peek numEventsPtr
 
-getEvent :: HANDLE -> Chan Event -> IO Event
+getEvent :: HANDLE -> TChan Event -> IO Event
 getEvent h = keyEventLoop (eventReader h)
 
 eventReader :: HANDLE -> IO [Event]
@@ -165,9 +173,6 @@ getKeyEvent p = do
 data Coord = Coord {coordX, coordY :: Int}
                 deriving Show
 
-#if __GLASGOW_HASKELL__ < 711
-#let alignment t = "%lu", (unsigned long)offsetof(struct {char x__; t (y__); }, y__)
-#endif
 instance Storable Coord where
     sizeOf _ = (#size COORD)
     alignment _ = (#alignment COORD)
@@ -242,7 +247,7 @@ foreign import WINDOWS_CCONV "windows.h GetConsoleMode" c_GetConsoleMode
 foreign import WINDOWS_CCONV "windows.h SetConsoleMode" c_SetConsoleMode
     :: HANDLE -> DWORD -> IO Bool
 
-withWindowMode :: MonadException m => Handles -> m a -> m a
+withWindowMode :: (MonadIO m, MonadMask m) => Handles -> m a -> m a
 withWindowMode hs f = do
     let h = hIn hs
     bracket (getConsoleMode h) (setConsoleMode h)
@@ -262,7 +267,8 @@ closeHandles :: Handles -> IO ()
 closeHandles hs = closeHandle (hIn hs) >> closeHandle (hOut hs)
 
 newtype Draw m a = Draw {runDraw :: ReaderT Handles m a}
-    deriving (Functor, Applicative, Monad, MonadIO, MonadException, MonadReader Handles)
+    deriving (Functor, Applicative, Monad, MonadIO, MonadReader Handles,
+              MonadThrow, MonadCatch, MonadMask)
 
 type DrawM a = forall m . (MonadIO m, MonadReader Layout m) => Draw m a
 
@@ -348,7 +354,7 @@ movePosLeft str = do
 crlf :: String
 crlf = "\r\n"
 
-instance (MonadException m, MonadReader Layout m) => Term (Draw m) where
+instance (MonadMask m, MonadIO m, MonadReader Layout m) => Term (Draw m) where
     drawLineDiff (xs1,ys1) (xs2,ys2) = let
         fixEsc = filter ((/= '\ESC') . baseChar)
         in drawLineDiffWin (fixEsc xs1, fixEsc ys1) (fixEsc xs2, fixEsc ys2)
@@ -377,7 +383,7 @@ win32TermStdin = do
 win32Term :: MaybeT IO RunTerm
 win32Term = do
     hs <- consoleHandles
-    ch <- liftIO newChan
+    ch <- liftIO newTChanIO
     fileRT <- liftIO $ fileRunTerm stdin
     return fileRT
       { termOps = Left TermOps {
@@ -387,14 +393,14 @@ win32Term = do
           , saveUnusedKeys = saveKeys ch
           , evalTerm = EvalTerm (runReaderT' hs . runDraw)
                               (Draw . lift)
-          , externalPrint = writeChan ch . ExternalPrint
+          , externalPrint = atomically . writeTChan ch . ExternalPrint
           }
       , closeTerm = do
           flushEventQueue (putStrOut fileRT) ch
           closeHandles hs
       }
 
-win32WithEvent :: MonadException m => Handles -> Chan Event
+win32WithEvent :: MonadIO m => Handles -> TChan Event
                                         -> (m Event -> m a) -> m a
 win32WithEvent h eventChan f = f $ liftIO $ getEvent (hIn h) eventChan
 
@@ -440,7 +446,7 @@ foreign import WINDOWS_CCONV "windows.h SetConsoleCtrlHandler" c_SetConsoleCtrlH
     :: FunPtr Handler -> BOOL -> IO BOOL
 
 -- sets the tv to True when ctrl-c is pressed.
-withCtrlCHandler :: MonadException m => m a -> m a
+withCtrlCHandler :: (MonadMask m, MonadIO m) => m a -> m a
 withCtrlCHandler f = bracket (liftIO $ do
                                     tid <- myThreadId
                                     fp <- wrapHandler (handler tid)
