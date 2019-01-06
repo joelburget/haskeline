@@ -15,15 +15,18 @@ import qualified System.Console.Haskeline.InputT as I
 import qualified System.Console.Haskeline.Key as K
 
 import qualified Control.Monad.Trans.Reader as Reader
+import           Control.Monad.Catch
 
 import Brick hiding (Widget, render)
 import qualified Brick as B
 import qualified Brick.BChan as BC
 import qualified Graphics.Vty as V
 
-import Control.Concurrent
+import Control.Concurrent (MVar, putMVar, newEmptyMVar, takeMVar)
+import Control.Concurrent.STM.TChan
+import Control.Monad.STM
 
-data Config e = MkConfig { fromBrickChan :: Chan Event
+data Config e = MkConfig { fromBrickChan :: TChan Event
                          , toAppChan :: BC.BChan e
                          , toAppEventType :: ToBrick -> e
                          , fromAppEventType :: e -> Maybe ToBrick
@@ -41,7 +44,7 @@ configure :: BC.BChan e
           -> (e -> Maybe ToBrick)
           -> IO (Config e)
 configure toAppChan' toAppEventType' fromAppEventType' = do
-    ch <- newChan
+    ch <- newTChanIO
     return $ MkConfig { fromBrickChan = ch
                       , toAppChan = toAppChan'
                       , toAppEventType = toAppEventType'
@@ -100,7 +103,7 @@ handleEvent c w (AppEvent e) =
       Nothing -> return w
 
 handleEvent c w (VtyEvent (V.EvKey k ms)) = do
-    liftIO $ writeChan (fromBrickChan c) $ mkKeyEvent k
+    liftIO $ atomically $ writeTChan (fromBrickChan c) $ mkKeyEvent k
     return w
         where
             mkKeyEvent :: V.Key -> Event
@@ -148,10 +151,12 @@ brickRunTerm :: Config e -> IO RunTerm
 brickRunTerm c = do
     let tops = TermOps { getLayout = getLayout'
                        , withGetEvent = withGetEvent'
+                       -- saveUnusedKeys :: [Key] -> IO ()
+                       -- saveKeys :: TChan Event -> [Key] -> IO ()
                        , saveUnusedKeys = saveKeys (fromBrickChan c)
                        , evalTerm = evalBrickTerm c
-                       , externalPrint =
-                           writeChan (fromBrickChan c) . ExternalPrint
+                       , externalPrint = atomically .
+                           writeTChan (fromBrickChan c) . ExternalPrint
                        }
     return $ RunTerm { putStrOut = putStrOut'
                      , termOps = Left tops
@@ -176,16 +181,36 @@ brickRunTerm c = do
 
             withGetEvent' :: forall m a . CommandMonad m
                           => (m Event -> m a) -> m a
-            withGetEvent' f = f $ liftIO $ readChan (fromBrickChan c)
+            withGetEvent' f = f $ liftIO $ atomically $ readTChan $ fromBrickChan c
 
 newtype BrickTerm m a =
     MkBrickTerm { unBrickTerm :: ReaderT (ToBrick -> IO ()) m a }
-    deriving ( MonadException, MonadIO, Monad, Applicative, Functor
+    deriving ( MonadIO, Monad, Applicative, Functor
              , MonadReader (ToBrick -> IO ())
              )
 
 instance MonadTrans BrickTerm where
     lift = MkBrickTerm . lift
+
+instance MonadThrow m => MonadThrow (BrickTerm m) where
+  throwM = MkBrickTerm . throwM
+
+instance MonadCatch m => MonadCatch (BrickTerm m) where
+  catch (MkBrickTerm m) f = MkBrickTerm (catch m (unBrickTerm . f))
+
+instance MonadMask m => MonadMask (BrickTerm m) where
+  mask a = MkBrickTerm $ mask $ \u -> unBrickTerm (a $ q u)
+    where q u = MkBrickTerm . u . unBrickTerm
+
+  uninterruptibleMask a =
+    MkBrickTerm $ uninterruptibleMask $ \u -> unBrickTerm (a $ q u)
+      where q u = MkBrickTerm . u . unBrickTerm
+
+  generalBracket acquire release use = MkBrickTerm $
+    generalBracket
+      (unBrickTerm acquire)
+      (\resource exitCase -> unBrickTerm (release resource exitCase))
+      (\resource -> unBrickTerm (use resource))
 
 evalBrickTerm :: (CommandMonad m) => Config e -> EvalTerm m
 evalBrickTerm c = EvalTerm
@@ -193,7 +218,7 @@ evalBrickTerm c = EvalTerm
     (MkBrickTerm . lift)
         where send = BC.writeBChan (toAppChan c) . toAppEventType c
 
-instance (MonadReader Layout m, MonadException m)
+instance (MonadReader Layout m, MonadMask m, MonadIO m)
   => Term (BrickTerm m) where
     reposition _ _ = return ()
     moveToNextLine _ = sendToBrick MoveToNextLine

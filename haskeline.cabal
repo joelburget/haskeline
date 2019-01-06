@@ -51,7 +51,7 @@ Library
                    directory>=1.1 && < 1.4, bytestring>=0.9 && < 0.11,
                    filepath >= 1.2 && < 1.5, transformers >= 0.2 && < 0.6,
                    process >= 1.0 && < 1.7, stm >= 2.4 && < 2.6,
-                   exceptions == 0.10.*
+                   exceptions == 0.10.*, brick >= 0.17, vty >= 5.15
     Default-Language: Haskell98
     Default-Extensions:
                 ForeignFunctionInterface, Rank2Types, FlexibleInstances,
@@ -65,6 +65,7 @@ Library
                 PatternGuards
     Exposed-Modules:
                 System.Console.Haskeline
+                System.Console.Haskeline.Brick
                 System.Console.Haskeline.Completion
                 System.Console.Haskeline.History
                 System.Console.Haskeline.IO
@@ -115,8 +116,3 @@ Library
         }
     }
     ghc-options: -Wall
-
-    if flag(brick) {
-        Build-Depends: brick >= 0.17, vty >= 5.15
-        Exposed-Modules: System.Console.Haskeline.Brick
-    }
