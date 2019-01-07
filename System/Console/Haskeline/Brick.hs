@@ -26,123 +26,129 @@ import Control.Concurrent (MVar, putMVar, newEmptyMVar, takeMVar)
 import Control.Concurrent.STM.TChan
 import Control.Monad.STM
 
-data Config e = MkConfig { fromBrickChan :: TChan Event
-                         , toAppChan :: BC.BChan e
-                         , toAppEventType :: ToBrick -> e
-                         , fromAppEventType :: e -> Maybe ToBrick
-                         }
+data Config e = MkConfig
+  { fromBrickChan    :: TChan Event
+  , toAppChan        :: BC.BChan e
+  , toAppEventType   :: ToBrick -> e
+  , fromAppEventType :: e -> Maybe ToBrick
+  }
 
-data Widget n = MkWidget { name :: n
-                         , visibleLines :: [String]
-                         , hiddenLines :: [String]
-                         , current :: (String, String)
-                         , extent :: Maybe (Int, Int)
-                         }
+data Widget n = MkWidget
+  { name         :: n
+  , visibleLines :: [String]
+  , hiddenLines  :: [String]
+  , current      :: (String, String)
+  , extent       :: Maybe (Int, Int)
+  }
 
-configure :: BC.BChan e
-          -> (ToBrick -> e)
-          -> (e -> Maybe ToBrick)
-          -> IO (Config e)
+configure
+  :: BC.BChan e
+  -> (ToBrick -> e)
+  -> (e -> Maybe ToBrick)
+  -> IO (Config e)
 configure toAppChan' toAppEventType' fromAppEventType' = do
-    ch <- newTChanIO
-    return $ MkConfig { fromBrickChan = ch
-                      , toAppChan = toAppChan'
-                      , toAppEventType = toAppEventType'
-                      , fromAppEventType = fromAppEventType'
-                      }
+  ch <- newTChanIO
+  pure $ MkConfig
+    { fromBrickChan    = ch
+    , toAppChan        = toAppChan'
+    , toAppEventType   = toAppEventType'
+    , fromAppEventType = fromAppEventType'
+    }
 
 initialWidget :: n -> Widget n
-initialWidget n = MkWidget { name = n
-                           , visibleLines = []
-                           , hiddenLines = []
-                           , current = ("", "")
-                           , extent = Nothing
-                           }
+initialWidget n = MkWidget
+  { name         = n
+  , visibleLines = []
+  , hiddenLines  = []
+  , current      = ("", "")
+  , extent       = Nothing
+  }
 
-data ToBrick = LayoutRequest (MVar (Maybe Layout))
-             | MoveToNextLine
-             | PrintLines [String]
-             | DrawLineDiff LineChars
-             | ClearLayout
+data ToBrick
+  = LayoutRequest (MVar (Maybe Layout))
+  | MoveToNextLine
+  | PrintLines [String]
+  | DrawLineDiff LineChars
+  | ClearLayout
 
-handleEvent :: (Eq n) => Config e
-            -> Widget n -> BrickEvent n e -> EventM n (Widget n)
-handleEvent c w (AppEvent e) =
-    case (fromAppEventType c) e of
-      Just (LayoutRequest mv) -> do
-          me <- lookupExtent (name w)
-          case me of
-            Just (Extent _ _ (wid, he) _) -> do
-                liftIO . putMVar mv $ Just $ Layout wid he
-                return $ w { extent = Just (wid, he) }
-            Nothing -> do
-                liftIO . putMVar mv $ Nothing
-                return w
+handleEvent
+  :: Eq n
+  => Config e -> Widget n -> BrickEvent n e -> EventM n (Widget n)
+handleEvent c w (AppEvent e) = case (fromAppEventType c) e of
+  Just (LayoutRequest mv) -> do
+      me <- lookupExtent (name w)
+      case me of
+        Just (Extent _ _ (wid, he) _) -> do
+            liftIO . putMVar mv $ Just $ Layout wid he
+            pure $ w { extent = Just (wid, he) }
+        Nothing -> do
+            liftIO . putMVar mv $ Nothing
+            pure w
 
-      Just MoveToNextLine -> do
-          let (pre,suff) = current w
-              w' = w { visibleLines = visibleLines w ++ [pre ++ suff]
-                     , current = ("", "")
-                     }
-          let vp = viewportScroll (name w)
-          vScrollToEnd vp
-          return w'
+  Just MoveToNextLine -> do
+      let (pre,suff) = current w
+          w' = w { visibleLines = visibleLines w ++ [pre ++ suff]
+                 , current = ("", "")
+                 }
+      let vp = viewportScroll (name w)
+      vScrollToEnd vp
+      pure w'
 
-      Just (PrintLines ls) -> do
-          return $ w { visibleLines = visibleLines w ++ ls }
+  Just (PrintLines ls) -> do
+      pure $ w { visibleLines = visibleLines w ++ ls }
 
-      Just (DrawLineDiff (pre, suff)) -> do
-          return $ w { current = ( graphemesToString pre
-                                 , graphemesToString suff) }
+  Just (DrawLineDiff (pre, suff)) -> do
+      pure $ w { current = ( graphemesToString pre
+                           , graphemesToString suff) }
 
-      Just ClearLayout -> do
-          return $ w { visibleLines = []
-                     , hiddenLines = hiddenLines w ++ visibleLines w
-                     }
+  Just ClearLayout -> do
+      pure $ w { visibleLines = []
+                 , hiddenLines = hiddenLines w ++ visibleLines w
+                 }
 
-      Nothing -> return w
+  Nothing -> pure w
 
 handleEvent c w (VtyEvent (V.EvKey k ms)) = do
-    liftIO $ atomically $ writeTChan (fromBrickChan c) $ mkKeyEvent k
-    return w
-        where
-            mkKeyEvent :: V.Key -> Event
-            mkKeyEvent (V.KChar c') =
-                KeyInput [ addModifiers ms $ K.simpleKey (K.KeyChar c') ]
-            mkKeyEvent V.KEnter =
-                KeyInput [ addModifiers ms $ K.simpleKey (K.KeyChar '\n') ]
-            mkKeyEvent V.KBS =
-                KeyInput [ addModifiers ms $ K.simpleKey K.Backspace ]
-            mkKeyEvent V.KDel =
-                KeyInput [ addModifiers ms $ K.simpleKey K.Delete ]
-            mkKeyEvent V.KLeft =
-                KeyInput [ addModifiers ms $ K.simpleKey K.LeftKey ]
-            mkKeyEvent V.KRight =
-                KeyInput [ addModifiers ms $ K.simpleKey K.RightKey ]
-            mkKeyEvent V.KUp =
-                KeyInput [ addModifiers ms $ K.simpleKey K.UpKey ]
-            mkKeyEvent V.KDown =
-                KeyInput [ addModifiers ms $ K.simpleKey K.DownKey ]
-            mkKeyEvent _ = KeyInput []
+  liftIO $ atomically $ writeTChan (fromBrickChan c) $ mkKeyEvent k
+  pure w
+  where
+    mkKeyEvent :: V.Key -> Event
+    mkKeyEvent (V.KChar c') =
+        KeyInput [ addModifiers ms $ K.simpleKey (K.KeyChar c') ]
+    mkKeyEvent V.KEnter =
+        KeyInput [ addModifiers ms $ K.simpleKey (K.KeyChar '\n') ]
+    mkKeyEvent V.KBS =
+        KeyInput [ addModifiers ms $ K.simpleKey K.Backspace ]
+    mkKeyEvent V.KDel =
+        KeyInput [ addModifiers ms $ K.simpleKey K.Delete ]
+    mkKeyEvent V.KLeft =
+        KeyInput [ addModifiers ms $ K.simpleKey K.LeftKey ]
+    mkKeyEvent V.KRight =
+        KeyInput [ addModifiers ms $ K.simpleKey K.RightKey ]
+    mkKeyEvent V.KUp =
+        KeyInput [ addModifiers ms $ K.simpleKey K.UpKey ]
+    mkKeyEvent V.KDown =
+        KeyInput [ addModifiers ms $ K.simpleKey K.DownKey ]
+    mkKeyEvent _ = KeyInput []
 
-            addModifiers :: [V.Modifier] -> K.Key -> K.Key
-            addModifiers [] k' = k'
-            addModifiers (V.MShift:tl) (K.Key m bc) =
-                addModifiers tl $ (K.Key m { K.hasShift = True } bc)
-            addModifiers (V.MCtrl:tl) (K.Key m (K.KeyChar c')) =
-                addModifiers tl $ K.Key m (K.KeyChar $ K.setControlBits c')
-            addModifiers (V.MCtrl:tl) k' = addModifiers tl . K.ctrlKey $ k'
-            addModifiers (V.MMeta:tl) k' = addModifiers tl . K.metaKey $ k'
-            addModifiers (V.MAlt:tl) k' = addModifiers tl k'
+    addModifiers :: [V.Modifier] -> K.Key -> K.Key
+    addModifiers [] k' = k'
+    addModifiers (V.MShift:tl) (K.Key m bc) =
+        addModifiers tl $ (K.Key m { K.hasShift = True } bc)
+    addModifiers (V.MCtrl:tl) (K.Key m (K.KeyChar c')) =
+        addModifiers tl $ K.Key m (K.KeyChar $ K.setControlBits c')
+    addModifiers (V.MCtrl:tl) k' = addModifiers tl . K.ctrlKey $ k'
+    addModifiers (V.MMeta:tl) k' = addModifiers tl . K.metaKey $ k'
+    addModifiers (V.MAlt:tl) k' = addModifiers tl k'
 
 handleEvent _ w (VtyEvent (V.EvResize _ _)) = do
     me <- lookupExtent (name w)
     case me of
       Just (Extent _ _ (wid, he) _) -> do
-          return $ w { extent = Just (wid, he) }
-      Nothing -> return w
+          pure $ w { extent = Just (wid, he) }
+      Nothing -> pure w
 
-handleEvent _ w _ = return w
+handleEvent _ w _ = pure w
 
 useBrick :: Config e -> I.Behavior
 useBrick c = I.Behavior (brickRunTerm c)
@@ -158,11 +164,12 @@ brickRunTerm c = do
                        , externalPrint = atomically .
                            writeTChan (fromBrickChan c) . ExternalPrint
                        }
-    return $ RunTerm { putStrOut = putStrOut'
-                     , termOps = Left tops
-                     , wrapInterrupt = id
-                     , closeTerm = return ()
-                     }
+    pure $ RunTerm
+      { putStrOut = putStrOut'
+      , termOps = Left tops
+      , wrapInterrupt = id
+      , closeTerm = pure ()
+      }
         where
             putStrOut' :: String -> IO ()
             putStrOut' s = do
@@ -176,8 +183,8 @@ brickRunTerm c = do
                 BC.writeBChan (toAppChan c) e
                 ml <- takeMVar mv
                 case ml of
-                  Just l -> return $ l
-                  Nothing -> return $ Layout 0 0
+                  Just l -> pure l
+                  Nothing -> pure $ Layout 0 0
 
             withGetEvent' :: forall m a . CommandMonad m
                           => (m Event -> m a) -> m a
@@ -220,17 +227,17 @@ evalBrickTerm c = EvalTerm
 
 instance (MonadReader Layout m, MonadMask m, MonadIO m)
   => Term (BrickTerm m) where
-    reposition _ _ = return ()
+    reposition _ _   = pure ()
     moveToNextLine _ = sendToBrick MoveToNextLine
-    printLines ls = sendToBrick $ PrintLines ls
+    printLines ls    = sendToBrick $ PrintLines ls
     drawLineDiff _ d = sendToBrick $ DrawLineDiff d
-    clearLayout = sendToBrick $ ClearLayout
-    ringBell _ = return ()
+    clearLayout      = sendToBrick $ ClearLayout
+    ringBell _       = pure ()
 
 sendToBrick :: MonadIO m => ToBrick -> BrickTerm m ()
 sendToBrick e = do
-    f <- ask
-    liftIO $ f e
+  f <- ask
+  liftIO $ f e
 
 render :: (Ord n, Show n) => Widget n -> B.Widget n
 render (MkWidget { name = n
